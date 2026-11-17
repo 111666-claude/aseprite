@@ -5,6 +5,7 @@ import (
 	"compress/zlib"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"io"
@@ -154,6 +155,88 @@ func (f *file) initPalette() {
 	}
 }
 
+// https://github.com/aseprite/aseprite/blob/main/docs/ase-file-specs.md#tileset-chunk-0x2023
+func (f *file) parseChunk2023(raw []byte) (tileset, error) {
+	var ts tileset
+
+	if len(raw) < 32 {
+		return ts, errors.New("aseprite: truncated tileset chunk")
+	}
+
+	flags := binary.LittleEndian.Uint32(raw[4:])
+	ntiles := int(binary.LittleEndian.Uint32(raw[8:]))
+	tilew := int(binary.LittleEndian.Uint16(raw[12:]))
+	tileh := int(binary.LittleEndian.Uint16(raw[14:]))
+
+	if flags&1 != 0 {
+		return ts, errors.New("aseprite: external tilesets are not supported")
+	}
+
+	if flags&2 == 0 {
+		return ts, errors.New("aseprite: tileset has no embedded tiles")
+	}
+
+	if tilew <= 0 || tileh <= 0 || ntiles <= 0 {
+		return ts, errors.New("aseprite: invalid tileset dimensions")
+	}
+
+	// skip base index and reserved bytes, then the tileset name
+	raw = raw[32:]
+	if len(raw) < 2 {
+		return ts, errors.New("aseprite: truncated tileset chunk")
+	}
+	n := int(binary.LittleEndian.Uint16(raw))
+	raw = raw[2:]
+	if len(raw) < n+4 {
+		return ts, errors.New("aseprite: truncated tileset chunk")
+	}
+	raw = raw[n:]
+
+	zlen := int(binary.LittleEndian.Uint32(raw))
+	raw = raw[4:]
+	if len(raw) < zlen {
+		return ts, errors.New("aseprite: truncated tileset data")
+	}
+
+	zr, err := zlib.NewReader(bytes.NewReader(raw[:zlen]))
+	if err != nil {
+		return ts, err
+	}
+	pix, err := io.ReadAll(zr)
+	if err != nil {
+		return ts, err
+	}
+
+	want := int64(tilew) * int64(tileh) * int64(ntiles) * int64(f.bpp) / 8
+	if int64(len(pix)) != want {
+		return ts, fmt.Errorf("aseprite: unexpected tileset data size %d, want %d", len(pix), want)
+	}
+
+	ts.image = f.makeTilesetImage(tilew, tileh*ntiles, pix)
+	ts.tilew = tilew
+	ts.tileh = tileh
+	ts.ntiles = ntiles
+	ts.empty0 = flags&4 != 0
+
+	return ts, nil
+}
+
+func (f *file) initTilesets() error {
+	for i := range f.frames {
+		for _, ch := range f.frames[i].chunks {
+			if ch.typ == 0x2023 {
+				ts, err := f.parseChunk2023(ch.raw)
+				if err != nil {
+					return err
+				}
+				f.tilesets = append(f.tilesets, ts)
+			}
+		}
+	}
+
+	return nil
+}
+
 func (f *file) initLayers() error {
 	chunks := f.frames[0].chunks
 	for i, ch := range chunks {
@@ -182,11 +265,15 @@ func (f *file) initLayers() error {
 }
 
 func (f *file) parseChunk2005(frame int, raw []byte) (*cel, error) {
-	layer := binary.LittleEndian.Uint16(raw)
+	layer := int(binary.LittleEndian.Uint16(raw))
 	xpos := int(binary.LittleEndian.Uint16(raw[2:]))
 	ypos := int(binary.LittleEndian.Uint16(raw[4:]))
 	opacity := raw[6]
 	celtype := binary.LittleEndian.Uint16(raw[7:])
+
+	if layer >= len(f.layers) {
+		return nil, fmt.Errorf("aseprite: cel references invalid layer index %d", layer)
+	}
 
 	// invisible layer
 	if f.layers[layer].flags&1 == 0 {
@@ -227,6 +314,56 @@ func (f *file) parseChunk2005(frame int, raw []byte) (*cel, error) {
 		}
 		bounds := image.Rect(xpos, ypos, xpos+width, ypos+height)
 		cel := f.makeCel(f, bounds, opacity, pix)
+		f.frames[frame].cels[layer] = cel
+	case 3: // compressed tilemap
+		l := f.layers[layer]
+
+		if l.typ != 2 {
+			return nil, errors.New("aseprite: tilemap cel on non-tilemap layer")
+		}
+
+		if l.tileset < 0 || l.tileset >= len(f.tilesets) {
+			return nil, fmt.Errorf("aseprite: layer references invalid tileset index %d", l.tileset)
+		}
+
+		if len(raw) < 32 {
+			return nil, errors.New("aseprite: truncated tilemap cel")
+		}
+
+		width := int(binary.LittleEndian.Uint16(raw))
+		height := int(binary.LittleEndian.Uint16(raw[2:]))
+
+		if width <= 0 || height <= 0 {
+			return nil, errors.New("aseprite: invalid tilemap dimensions")
+		}
+
+		if bpt := binary.LittleEndian.Uint16(raw[4:]); bpt != 32 {
+			return nil, fmt.Errorf("aseprite: unsupported %d bits per tile", bpt)
+		}
+
+		idMask := binary.LittleEndian.Uint32(raw[6:])
+		xMask := binary.LittleEndian.Uint32(raw[10:])
+		yMask := binary.LittleEndian.Uint32(raw[14:])
+		dMask := binary.LittleEndian.Uint32(raw[18:])
+
+		zr, err := zlib.NewReader(bytes.NewReader(raw[32:]))
+		if err != nil {
+			return nil, err
+		}
+		pix, err := io.ReadAll(zr)
+		if err != nil {
+			return nil, err
+		}
+
+		if want := width * height * 4; len(pix) != want {
+			return nil, fmt.Errorf("aseprite: unexpected tilemap data size %d, want %d", len(pix), want)
+		}
+
+		ts := &f.tilesets[l.tileset]
+		cel, err := f.makeTilemapCel(ts, xpos, ypos, width, height, opacity, pix, idMask, xMask, yMask, dMask)
+		if err != nil {
+			return nil, err
+		}
 		f.frames[frame].cels[layer] = cel
 	default:
 		return nil, errors.New("unsupported cel type")

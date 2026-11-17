@@ -3,7 +3,8 @@
 // Layers are flattened, blending modes are applied,
 // and frames are arranged on a single texture atlas.
 // Invisible and reference layers are ignored.
-// Tilesets and external files are not supported.
+// Tilemap layers with embedded tilesets are supported.
+// External files are not supported.
 //
 // Aseprite file format spec: https://github.com/aseprite/aseprite/blob/main/docs/ase-file-specs.md
 package aseprite
@@ -105,6 +106,10 @@ func (spr *Aseprite) readFrom(r io.Reader) error {
 	}
 
 	f.initPalette()
+
+	if err := f.initTilesets(); err != nil {
+		return err
+	}
 
 	if err := f.initLayers(); err != nil {
 		return err

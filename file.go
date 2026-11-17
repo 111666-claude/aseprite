@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
@@ -74,19 +75,169 @@ func makeCelImage32(f *file, bounds image.Rectangle, opacity byte, pix []byte) c
 
 type layer struct {
 	flags     uint16
+	typ       uint16
 	blendMode uint16
 	opacity   byte
+	tileset   int // index into file.tilesets, -1 if not a tilemap layer
 	data      []byte
 }
 
 func (l *layer) Parse(raw []byte) error {
-	if typ := binary.LittleEndian.Uint16(raw[2:]); typ == 2 {
-		return errors.New("tilemap layers not supported")
+	if len(raw) < 16 {
+		return errors.New("aseprite: truncated layer chunk")
 	}
+
 	l.flags = binary.LittleEndian.Uint16(raw)
+	l.typ = binary.LittleEndian.Uint16(raw[2:])
 	l.blendMode = binary.LittleEndian.Uint16(raw[10:])
 	l.opacity = raw[12]
+	l.tileset = -1
+
+	// tilemap layers reference a tileset by index
+	if l.typ == 2 {
+		raw = raw[16:]
+		if len(raw) < 2 {
+			return errors.New("aseprite: truncated layer chunk")
+		}
+		n := int(binary.LittleEndian.Uint16(raw)) // layer name
+		raw = raw[2:]
+		if len(raw) < n+4 {
+			return errors.New("aseprite: truncated tilemap layer chunk")
+		}
+		l.tileset = int(int32(binary.LittleEndian.Uint32(raw[n:])))
+	}
+
 	return nil
+}
+
+// tileset is an embedded set of tiles referenced by tilemap layers.
+type tileset struct {
+	image  image.Image // tiles stacked in a vertical strip
+	tilew  int
+	tileh  int
+	ntiles int
+	empty0 bool // tile ID 0 is the empty tile
+}
+
+// makeTilesetImage converts raw tileset pixels into an image strip
+// of one tile width and ntiles*tileheight height, using the file's
+// color model.
+func (f *file) makeTilesetImage(w, h int, pix []byte) image.Image {
+	switch f.bpp {
+	case 8:
+		return &image.Paletted{
+			Pix:     pix,
+			Stride:  w,
+			Rect:    image.Rect(0, 0, w, h),
+			Palette: f.palette,
+		}
+	case 16:
+		// 16 bpp grayscale+alpha -> NRGBA
+		img := image.NewNRGBA(image.Rect(0, 0, w, h))
+		stride := w * 2
+		for y := 0; y < h; y++ {
+			for x := 0; x < w; x++ {
+				i := y*stride + x*2
+				grayValue := pix[i]
+				alphaValue := pix[i+1]
+				img.SetNRGBA(x, y, color.NRGBA{
+					R: grayValue,
+					G: grayValue,
+					B: grayValue,
+					A: alphaValue,
+				})
+			}
+		}
+		return img
+	default:
+		return &image.NRGBA{
+			Pix:    pix,
+			Stride: w * 4,
+			Rect:   image.Rect(0, 0, w, h),
+		}
+	}
+}
+
+// makeTilemapCel builds a cel image from decompressed tilemap cel data.
+// Each tile is looked up in the tileset and drawn at its grid position
+// with its flip flags applied.
+func (f *file) makeTilemapCel(ts *tileset, xpos, ypos, w, h int, opacity byte, data []byte, idMask, xMask, yMask, dMask uint32) (cel, error) {
+	bounds := image.Rect(xpos, ypos, xpos+w*ts.tilew, ypos+h*ts.tileh)
+
+	var img draw.Image
+	if f.bpp == 8 {
+		p := image.NewPaletted(bounds, f.palette)
+		// empty tiles must stay transparent
+		if f.transparent != 0 {
+			for i := range p.Pix {
+				p.Pix[i] = f.transparent
+			}
+		}
+		img = p
+	} else {
+		img = image.NewNRGBA(bounds)
+	}
+
+	for ty := 0; ty < h; ty++ {
+		for tx := 0; tx < w; tx++ {
+			v := binary.LittleEndian.Uint32(data[(ty*w+tx)*4:])
+			id := v & idMask
+
+			if id == 0 && ts.empty0 {
+				continue
+			}
+
+			if id >= uint32(ts.ntiles) {
+				return cel{}, fmt.Errorf("aseprite: invalid tile index %d", id)
+			}
+
+			blitTile(img, ts, int(id),
+				xpos+tx*ts.tilew, ypos+ty*ts.tileh,
+				v&xMask != 0, v&yMask != 0, v&dMask != 0)
+		}
+	}
+
+	mask := image.Uniform{color.Alpha{opacity}}
+
+	return cel{img, mask, nil}, nil
+}
+
+// blitTile copies tile id from the tileset strip into dst at (dx, dy),
+// applying the x, y and diagonal (swap x/y) flip flags.
+func blitTile(dst draw.Image, ts *tileset, id, dx, dy int, fx, fy, fd bool) {
+	w, h := ts.tilew, ts.tileh
+	src := ts.image
+	sx := src.Bounds().Min.X
+	sy := src.Bounds().Min.Y + id*h
+
+	// copy palette indices directly to preserve them exactly
+	pdst, dstIsPal := dst.(*image.Paletted)
+	psrc, srcIsPal := src.(*image.Paletted)
+	direct := dstIsPal && srcIsPal
+
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			tx, ty := x, y
+			if fd {
+				tx, ty = ty, tx
+			}
+			if fx {
+				tx = w - 1 - tx
+			}
+			if fy {
+				ty = h - 1 - ty
+			}
+			if tx < 0 || tx >= w || ty < 0 || ty >= h {
+				continue // diagonal flip of a non-square tile
+			}
+			if direct {
+				pdst.Pix[(dy+ty-pdst.Rect.Min.Y)*pdst.Stride+dx+tx-pdst.Rect.Min.X] =
+					psrc.Pix[(sy+y-psrc.Rect.Min.Y)*psrc.Stride+sx+x-psrc.Rect.Min.X]
+			} else {
+				dst.Set(dx+tx, dy+ty, src.At(sx+x, sy+y))
+			}
+		}
+	}
 }
 
 type chunk struct {
@@ -150,6 +301,7 @@ type file struct {
 	palette     color.Palette
 	frames      []frame
 	layers      []layer
+	tilesets    []tileset
 	makeCel     func(f *file, bounds image.Rectangle, opacity byte, pix []byte) cel
 }
 
