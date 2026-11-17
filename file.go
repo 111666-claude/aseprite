@@ -99,7 +99,15 @@ func (c chunk) Reader() io.Reader {
 }
 
 func (c *chunk) Read(raw []byte) ([]byte, error) {
+	if len(raw) < 6 {
+		return raw, io.ErrUnexpectedEOF
+	}
+
 	chunkLen := binary.LittleEndian.Uint32(raw)
+	if int(chunkLen) < 6 || int(chunkLen) > len(raw) {
+		return raw, io.ErrUnexpectedEOF
+	}
+
 	c.typ = int(binary.LittleEndian.Uint16(raw[4:]))
 	c.raw = raw[6:chunkLen]
 	return raw[chunkLen:], nil
@@ -112,6 +120,15 @@ type frame struct {
 }
 
 func (f *frame) Read(raw []byte) ([]byte, error) {
+	if len(raw) < 16 {
+		return raw, io.ErrUnexpectedEOF
+	}
+
+	frameLen := binary.LittleEndian.Uint32(raw)
+	if int(frameLen) < 16 || int(frameLen) > len(raw) {
+		return raw, io.ErrUnexpectedEOF
+	}
+
 	if magic := binary.LittleEndian.Uint16(raw[4:]); magic != 0xF1FA {
 		return nil, errInvalidMagic
 	}
@@ -134,7 +151,10 @@ func (f *frame) Read(raw []byte) ([]byte, error) {
 
 	for i := 0; i < nchunks; i++ {
 		var c chunk
-		raw, _ = c.Read(raw)
+		var err error
+		if raw, err = c.Read(raw); err != nil {
+			return raw, err
+		}
 		f.chunks[i] = c
 	}
 

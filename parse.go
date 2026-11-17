@@ -8,6 +8,7 @@ import (
 	"image"
 	"image/color"
 	"io"
+	"sort"
 )
 
 func skipString(raw []byte) []byte {
@@ -282,70 +283,129 @@ func (f *file) buildTags() []Tag {
 	return nil
 }
 
-func parseSlice(s *Slice, flags uint32, raw []byte) []byte {
-	// framenum := binary.LittleEndian.Uint32(raw)
+// parseSliceKey parses a single slice key from raw.
+// Bounds are kept in sprite (canvas) coordinates; atlas mapping happens at
+// query time because a key can be inherited by later frames.
+// A truncated key yields ok=false and no key is added.
+func parseSliceKey(flags uint32, raw []byte) (SliceKey, []byte, bool) {
+	const (
+		keyBaseLen = 20
+		centerLen  = 16
+		pivotLen   = 8
+	)
+
+	keyLen := keyBaseLen
+	if flags&1 != 0 {
+		keyLen += centerLen
+	}
+	if flags&2 != 0 {
+		keyLen += pivotLen
+	}
+
+	if len(raw) < keyLen {
+		return SliceKey{}, raw, false
+	}
+
+	var k SliceKey
+	k.Frame = binary.LittleEndian.Uint32(raw)
 	x := int32(binary.LittleEndian.Uint32(raw[4:]))
 	y := int32(binary.LittleEndian.Uint32(raw[8:]))
 	w := binary.LittleEndian.Uint32(raw[12:])
 	h := binary.LittleEndian.Uint32(raw[16:])
-	raw = raw[20:]
+	raw = raw[keyBaseLen:]
 
-	var cx, cy int32
-	var cw, ch uint32
+	k.Bounds = image.Rect(int(x), int(y), int(x)+int(w), int(y)+int(h))
 
 	if flags&1 != 0 {
-		cx = int32(binary.LittleEndian.Uint32(raw))
-		cy = int32(binary.LittleEndian.Uint32(raw[4:]))
-		cw = binary.LittleEndian.Uint32(raw[8:])
-		ch = binary.LittleEndian.Uint32(raw[12:])
-		raw = raw[16:]
+		cx := int32(binary.LittleEndian.Uint32(raw))
+		cy := int32(binary.LittleEndian.Uint32(raw[4:]))
+		cw := binary.LittleEndian.Uint32(raw[8:])
+		ch := binary.LittleEndian.Uint32(raw[12:])
+		raw = raw[centerLen:]
+		k.Center = image.Rect(int(cx), int(cy), int(cx)+int(cw), int(cy)+int(ch))
 	}
-
-	var px, py int32
 
 	if flags&2 != 0 {
-		px = int32(binary.LittleEndian.Uint32(raw))
-		py = int32(binary.LittleEndian.Uint32(raw[4:]))
-		raw = raw[8:]
+		px := int32(binary.LittleEndian.Uint32(raw))
+		py := int32(binary.LittleEndian.Uint32(raw[4:]))
+		raw = raw[pivotLen:]
+		k.Pivot = image.Pt(int(px), int(py))
 	}
 
-	s.Bounds = image.Rect(int(x), int(y), int(x)+int(w), int(y)+int(h))
-	s.Center = image.Rect(int(cx), int(cy), int(cx)+int(cw), int(cy)+int(ch))
-	s.Pivot = image.Pt(int(px), int(py))
-
-	return raw
+	return k, raw, true
 }
 
-func (f *file) buildSlices() (slices []Slice) {
-	chunks := f.frames[0].chunks
-	for i, chunk := range chunks {
-		if chunk.typ == 0x2022 {
-			ofs := len(slices)
-			raw := chunk.raw
-			nslices := int(binary.LittleEndian.Uint32(raw))
-			flags := binary.LittleEndian.Uint32(raw[4:])
-			name := parseString(raw[12:])
+// buildSlices collects slice chunks from every frame. Each slice chunk becomes
+// one Slice whose Keys hold the raw keyframes, including their original frame
+// numbers. Keys are sorted so out-of-order definitions still resolve
+// deterministically. framesr maps a sprite frame to its atlas rectangle.
+func (f *file) buildSlices(framesr []image.Rectangle) (slices []Slice) {
+	for frameIdx := range f.frames {
+		chunks := f.frames[frameIdx].chunks
 
-			// parse each slice
-			raw = raw[14+len(name):]
-			for i := 0; len(raw) > 0 && i < nslices; i++ {
-				var s Slice
-				s.Name = name
-				raw = parseSlice(&s, flags, raw)
-				slices = append(slices, s)
+		for i, chunk := range chunks {
+			if chunk.typ != 0x2022 {
+				continue
 			}
 
-			// check for user data chunk
+			raw := chunk.raw
+
+			// Truncated header: keep whatever was parsed before.
+			if len(raw) < 14 {
+				break
+			}
+
+			nkeys := int(binary.LittleEndian.Uint32(raw))
+			flags := binary.LittleEndian.Uint32(raw[4:])
+			nameLen := int(binary.LittleEndian.Uint16(raw[12:]))
+			if len(raw) < 14+nameLen {
+				break
+			}
+			name := parseString(raw[12:])
+			raw = raw[14+len(name):]
+
+			var s Slice
+			s.Name = name
+
+			for j := 0; j < nkeys && len(raw) > 0; j++ {
+				var k SliceKey
+				var ok bool
+				if k, raw, ok = parseSliceKey(flags, raw); ok {
+					s.Keys = append(s.Keys, k)
+				} else {
+					// Truncated key: stop, the remaining keys cannot be parsed.
+					break
+				}
+			}
+
+			sort.SliceStable(s.Keys, func(i, j int) bool {
+				return s.Keys[i].Frame < s.Keys[j].Frame
+			})
+
+			// Static fields reflect the first key, mapped to the atlas so
+			// existing single-key slice reads keep working unchanged.
+			if len(s.Keys) > 0 {
+				k := s.Keys[0]
+				s.Center = k.Center
+				s.Pivot = k.Pivot
+				if int(k.Frame) < len(framesr) {
+					s.Bounds = k.Bounds.Add(framesr[k.Frame].Min)
+				} else {
+					s.Bounds = k.Bounds
+				}
+			}
+
+			// A user data chunk immediately following the slice chunk
+			// belongs to the slice.
 			if i < len(chunks)-1 {
 				if ud := chunks[i+1]; ud.typ == 0x2020 {
 					data, col := parseUserData(ud.raw)
-					data = append([]byte{}, data...) // copy
-					for j := ofs; j < len(slices); j++ {
-						slices[j].Data = data
-						slices[j].Color = col
-					}
+					s.Data = append([]byte{}, data...) // copy
+					s.Color = col
 				}
 			}
+
+			slices = append(slices, s)
 		}
 	}
 
