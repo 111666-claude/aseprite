@@ -53,6 +53,22 @@ sprite, err := aseprite.Read(f)
 
 Read the [documentation](https://pkg.go.dev/github.com/askeladdk/aseprite) for more information about what meta data is extracted.
 
+## Tag playback timeline
+
+A tag defines a frame range, a loop direction and a repeat count. Build a time-indexed playback timeline from the sprite's frames and tags, then look up the frame to display at any non-negative playback time:
+
+```go
+timeline, err := sprite.Timeline("walk")
+if errors.Is(err, aseprite.ErrInfiniteRepeat) {
+    // Repeat == 0 repeats forever in the editor and has no finite timeline.
+}
+
+frameIndex, err := timeline.FrameAt(elapsed)
+frame := sprite.Frames[frameIndex]
+```
+
+`NewTimeline(frames, tag)` constructs a timeline directly from a `Tag`, which also resolves duplicate tag names. The timeline supports `Forward`, `Reverse`, `PingPong` and `PingPongReverse` with finite repeats. Each `Segment` records its frame index and half-open `[Start, End)` playback interval; ping-pong turnaround frames are shown once rather than duplicated. `FrameAt` uses binary search and returns `ErrNegativeTime` or `ErrTimeOutOfRange` for times outside the timeline.
+
 ## License
 
 Package aseprite is released under the terms of the ISC license.
