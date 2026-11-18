@@ -53,6 +53,19 @@ sprite, err := aseprite.Read(f)
 
 Read the [documentation](https://pkg.go.dev/github.com/askeladdk/aseprite) for more information about what meta data is extracted.
 
+## 9-slice rendering
+
+Slices marked as 9-slices in Aseprite can be rendered to any size without cutting the image by hand. The corners are copied unscaled while the edges and center are stretched:
+
+```go
+sprite, err := aseprite.Read(f)
+
+// render the "button" slice of frame 0 to 200x40 pixels
+img, err := sprite.RenderSlice("button", 0, 200, 40)
+```
+
+Use `sprite.Slice(name, frame)` to read the bounds, center and pivot of the slice key that applies to a given frame.
+
 ## License
 
 Package aseprite is released under the terms of the ISC license.

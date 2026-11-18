@@ -283,7 +283,7 @@ func (f *file) buildTags() []Tag {
 }
 
 func parseSlice(s *Slice, flags uint32, raw []byte) []byte {
-	// framenum := binary.LittleEndian.Uint32(raw)
+	framenum := binary.LittleEndian.Uint32(raw)
 	x := int32(binary.LittleEndian.Uint32(raw[4:]))
 	y := int32(binary.LittleEndian.Uint32(raw[8:]))
 	w := binary.LittleEndian.Uint32(raw[12:])
@@ -312,37 +312,41 @@ func parseSlice(s *Slice, flags uint32, raw []byte) []byte {
 	s.Bounds = image.Rect(int(x), int(y), int(x)+int(w), int(y)+int(h))
 	s.Center = image.Rect(int(cx), int(cy), int(cx)+int(cw), int(cy)+int(ch))
 	s.Pivot = image.Pt(int(px), int(py))
+	s.Frame = int(framenum)
 
 	return raw
 }
 
 func (f *file) buildSlices() (slices []Slice) {
-	chunks := f.frames[0].chunks
-	for i, chunk := range chunks {
-		if chunk.typ == 0x2022 {
-			ofs := len(slices)
-			raw := chunk.raw
-			nslices := int(binary.LittleEndian.Uint32(raw))
-			flags := binary.LittleEndian.Uint32(raw[4:])
-			name := parseString(raw[12:])
+	// slice chunks may appear in any frame
+	for _, fr := range f.frames {
+		chunks := fr.chunks
+		for i, chunk := range chunks {
+			if chunk.typ == 0x2022 {
+				ofs := len(slices)
+				raw := chunk.raw
+				nslices := int(binary.LittleEndian.Uint32(raw))
+				flags := binary.LittleEndian.Uint32(raw[4:])
+				name := parseString(raw[12:])
 
-			// parse each slice
-			raw = raw[14+len(name):]
-			for i := 0; len(raw) > 0 && i < nslices; i++ {
-				var s Slice
-				s.Name = name
-				raw = parseSlice(&s, flags, raw)
-				slices = append(slices, s)
-			}
+				// parse each slice
+				raw = raw[14+len(name):]
+				for i := 0; len(raw) > 0 && i < nslices; i++ {
+					var s Slice
+					s.Name = name
+					raw = parseSlice(&s, flags, raw)
+					slices = append(slices, s)
+				}
 
-			// check for user data chunk
-			if i < len(chunks)-1 {
-				if ud := chunks[i+1]; ud.typ == 0x2020 {
-					data, col := parseUserData(ud.raw)
-					data = append([]byte{}, data...) // copy
-					for j := ofs; j < len(slices); j++ {
-						slices[j].Data = data
-						slices[j].Color = col
+				// check for user data chunk
+				if i < len(chunks)-1 {
+					if ud := chunks[i+1]; ud.typ == 0x2020 {
+						data, col := parseUserData(ud.raw)
+						data = append([]byte{}, data...) // copy
+						for j := ofs; j < len(slices); j++ {
+							slices[j].Data = data
+							slices[j].Color = col
+						}
 					}
 				}
 			}

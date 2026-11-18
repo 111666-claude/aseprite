@@ -71,6 +71,11 @@ type Slice struct {
 	// Name is the name of the slice. Can be duplicate.
 	Name string
 
+	// Frame is the frame number this slice key applies to.
+	// The key stays in effect for the following frames
+	// until the next key of a slice with the same name.
+	Frame int
+
 	// Data is optional user data.
 	Data []byte
 
