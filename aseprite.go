@@ -5,15 +5,26 @@
 // Invisible and reference layers are ignored.
 // Tilesets and external files are not supported.
 //
+// Per-layer texture atlases can be enabled through ReadWithOptions and
+// Options.LayerAtlases. When enabled, each drawable layer is additionally
+// exported on its own atlas together with per-frame cel metadata, while the
+// flattened composite image remains available as before. When disabled, no
+// extra image allocations are performed.
+//
 // Aseprite file format spec: https://github.com/aseprite/aseprite/blob/main/docs/ase-file-specs.md
 package aseprite
 
 import (
+	"errors"
 	"image"
 	"image/color"
+	"image/draw"
 	"io"
 	"time"
 )
+
+// ErrFrameNotFound is returned when a queried frame index does not exist.
+var ErrFrameNotFound = errors.New("aseprite: frame not found")
 
 // LoopDirection enumerates all loop animation directions.
 type LoopDirection uint8
@@ -95,10 +106,25 @@ type Aseprite struct {
 
 	// LayerData lists the user data of all visible layers.
 	LayerData [][]byte
+
+	// layers lists the metadata of every layer in the file. It is populated
+	// only when per-layer atlases are enabled through Options.
+	layers []Layer
+
+	// layerAtlases holds the per-layer texture atlases at each layer's
+	// file index. Hidden, reference and group layers have nil entries.
+	layerAtlases []draw.Image
+
+	// layerFrames holds per-frame cel descriptors at each layer's file index.
+	layerFrames [][]LayerFrame
 }
 
-func (spr *Aseprite) readFrom(r io.Reader) error {
+func (spr *Aseprite) readFrom(r io.Reader, opts *Options) error {
 	var f file
+
+	if opts != nil {
+		f.layerAtlas = opts.LayerAtlases
+	}
 
 	if _, err := f.ReadFrom(r); err != nil {
 		return err
@@ -121,5 +147,11 @@ func (spr *Aseprite) readFrom(r io.Reader) error {
 	spr.LayerData = f.buildLayerData(userdata)
 	spr.Tags = f.buildTags()
 	spr.Slices = f.buildSlices()
+
+	if f.layerAtlas {
+		spr.layers = f.buildLayerInfos()
+		spr.layerAtlases, spr.layerFrames = f.buildLayerAtlases()
+	}
+
 	return nil
 }

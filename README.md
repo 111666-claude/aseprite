@@ -53,6 +53,39 @@ sprite, err := aseprite.Read(f)
 
 Read the [documentation](https://pkg.go.dev/github.com/askeladdk/aseprite) for more information about what meta data is extracted.
 
+## Per-layer texture atlases
+
+The flattened composite image packs every layer together. When the layers
+must be exported separately (for example to package a character's body,
+clothes and weapon independently), enable per-layer atlases through
+`ReadWithOptions` and `Options.LayerAtlases`:
+
+```go
+sprite, err := aseprite.ReadWithOptions(f, &aseprite.Options{LayerAtlases: true})
+```
+
+Each drawable layer then gets its own texture atlas and a `LayerFrame`
+descriptor per frame describing the atlas region, cel bounds, opacity and
+whether the cel is linked. Layers are addressed by their stable file index
+or by name:
+
+```go
+layer, err := sprite.LayerByName("weapon")
+atlas, err := sprite.LayerAtlas(layer.Index)
+
+frame, err := sprite.LayerFrameAt(layer.Index, frameIndex)
+// frame.Bounds is the region of atlas holding this frame's pixels.
+```
+
+Every layer in the file is listed by `Layers`, including hidden, reference
+and group layers, but only visible, non-reference, non-group layers receive
+an atlas. Linked cels share their source frame's pixels, duplicate names are
+resolved with the first match (`LayerByName`) or all matches
+(`LayersByName`), and frames without a cel report an empty `LayerFrame`.
+The composite image and all other decode results are unchanged. When the
+option is left at its zero value (or `Read` is used) no per-layer images are
+allocated.
+
 ## License
 
 Package aseprite is released under the terms of the ISC license.

@@ -17,9 +17,22 @@ import (
 var errInvalidMagic = errors.New("invalid magic number")
 
 type cel struct {
-	image image.Image
-	mask  image.Uniform
-	data  []byte
+	image   image.Image
+	mask    image.Uniform
+	data    []byte
+	opacity byte
+	linked  bool
+}
+
+// fixPalettedIndices replaces palette indices that fall outside the palette
+// with the transparent index. This guards against colors that have been
+// deleted from the Aseprite palette.
+func fixPalettedIndices(img *image.Paletted, transparent uint8) {
+	for i := range img.Pix {
+		if int(img.Pix[i]) >= len(img.Palette) {
+			img.Pix[i] = transparent
+		}
+	}
 }
 
 func makeCelImage8(f *file, bounds image.Rectangle, opacity byte, pix []byte) cel {
@@ -32,7 +45,7 @@ func makeCelImage8(f *file, bounds image.Rectangle, opacity byte, pix []byte) ce
 
 	mask := image.Uniform{color.Alpha{opacity}}
 
-	return cel{&img, mask, nil}
+	return cel{image: &img, mask: mask}
 }
 
 func makeCelImage16(f *file, bounds image.Rectangle, opacity byte, pix []byte) cel {
@@ -57,7 +70,7 @@ func makeCelImage16(f *file, bounds image.Rectangle, opacity byte, pix []byte) c
 		}
 	}
 	mask := image.Uniform{color.Alpha{opacity}}
-	return cel{img, mask, nil}
+	return cel{image: img, mask: mask}
 }
 
 func makeCelImage32(f *file, bounds image.Rectangle, opacity byte, pix []byte) cel {
@@ -69,23 +82,37 @@ func makeCelImage32(f *file, bounds image.Rectangle, opacity byte, pix []byte) c
 
 	mask := image.Uniform{color.Alpha{opacity}}
 
-	return cel{&img, mask, nil}
+	return cel{image: &img, mask: mask}
 }
 
 type layer struct {
 	flags     uint16
+	typ       uint16
+	childLvl  uint16
 	blendMode uint16
 	opacity   byte
+	name      string
 	data      []byte
 }
 
 func (l *layer) Parse(raw []byte) error {
+	if len(raw) < 18 {
+		return errTruncatedLayer
+	}
+
 	if typ := binary.LittleEndian.Uint16(raw[2:]); typ == 2 {
 		return errors.New("tilemap layers not supported")
 	}
 	l.flags = binary.LittleEndian.Uint16(raw)
+	l.typ = binary.LittleEndian.Uint16(raw[2:])
+	l.childLvl = binary.LittleEndian.Uint16(raw[4:])
 	l.blendMode = binary.LittleEndian.Uint16(raw[10:])
 	l.opacity = raw[12]
+	nl := int(binary.LittleEndian.Uint16(raw[16:]))
+	if len(raw) < 18+nl {
+		return errTruncatedLayer
+	}
+	l.name = string(raw[18 : 18+nl])
 	return nil
 }
 
@@ -151,6 +178,7 @@ type file struct {
 	frames      []frame
 	layers      []layer
 	makeCel     func(f *file, bounds image.Rectangle, opacity byte, pix []byte) cel
+	layerAtlas  bool
 }
 
 func (f *file) ReadFrom(r io.Reader) (int64, error) {
@@ -247,12 +275,7 @@ func (f *file) buildAtlas() (atlas draw.Image, framesr []image.Rectangle) {
 
 			// Correction to avoid palette index errors if a color has been deleted from the Aseprite palette.
 			if imgPaletted, ok := src.(*image.Paletted); ok {
-				for i := range imgPaletted.Pix {
-					if int(imgPaletted.Pix[i]) >= len(f.palette) {
-						// Assign a transparent index if the index is outside the palette range.
-						imgPaletted.Pix[i] = f.transparent
-					}
-				}
+				fixPalettedIndices(imgPaletted, f.transparent)
 			}
 
 			if mode := f.layers[layer].blendMode; mode > 0 && int(mode) < len(blend.Modes) {
@@ -345,4 +368,132 @@ func factorPowerOfTwo(n int) (a, b int) {
 	a = 1 << (x - x/2)
 	b = 1 << (x / 2)
 	return
+}
+
+// newLayerAtlas allocates an empty per-layer atlas using the same pixel
+// format and frame grid as the composite atlas.
+func (f *file) newLayerAtlas(atlasr image.Rectangle) draw.Image {
+	switch f.bpp {
+	case 8:
+		return image.NewPaletted(atlasr, f.palette)
+	case 16:
+		return image.NewNRGBA(atlasr)
+	default:
+		return image.NewRGBA(atlasr)
+	}
+}
+
+// drawCelToAtlas paints a cel into its frame region of the layer atlas.
+// Sprite coordinates are translated by the frame region origin so cel
+// position (x,y) lands at fr.Min+(x,y); pixels landing outside the frame
+// region are clipped. Paletted indices are copied directly so layer pixels
+// keep their exact palette indices.
+func (f *file) drawCelToAtlas(atlas draw.Image, fr image.Rectangle, c cel) {
+	src := c.image
+	sr := src.Bounds()
+
+	if psrc, ok := src.(*image.Paletted); ok {
+		fixPalettedIndices(psrc, f.transparent)
+
+		if pdst, ok := atlas.(*image.Paletted); ok {
+			for y := sr.Min.Y; y < sr.Max.Y; y++ {
+				dy := fr.Min.Y + y
+				if dy < fr.Min.Y || dy >= fr.Max.Y {
+					continue
+				}
+				for x := sr.Min.X; x < sr.Max.X; x++ {
+					dx := fr.Min.X + x
+					if dx < fr.Min.X || dx >= fr.Max.X {
+						continue
+					}
+					pdst.SetColorIndex(dx, dy, psrc.ColorIndexAt(x, y))
+				}
+			}
+			return
+		}
+	}
+
+	for y := sr.Min.Y; y < sr.Max.Y; y++ {
+		dy := fr.Min.Y + y
+		if dy < fr.Min.Y || dy >= fr.Max.Y {
+			continue
+		}
+		for x := sr.Min.X; x < sr.Max.X; x++ {
+			dx := fr.Min.X + x
+			if dx < fr.Min.X || dx >= fr.Max.X {
+				continue
+			}
+			atlas.Set(dx, dy, src.At(x, y))
+		}
+	}
+}
+
+// buildLayerAtlases builds one atlas per drawable layer together with the
+// per-frame cel descriptors. Hidden, reference and group layers receive
+// neither and keep nil entries at their index.
+func (f *file) buildLayerAtlases() ([]draw.Image, [][]LayerFrame) {
+	atlasr, framesr := makeAtlasFrames(len(f.frames), f.framew, f.frameh)
+
+	nlayers := len(f.layers)
+	atlases := make([]draw.Image, nlayers)
+	lframes := make([][]LayerFrame, nlayers)
+
+	for li := range f.layers {
+		if !f.drawableLayer(li) {
+			continue
+		}
+
+		atlas := f.newLayerAtlas(atlasr)
+		lf := make([]LayerFrame, len(f.frames))
+
+		for fi := range f.frames {
+			lf[fi] = LayerFrame{Opacity: f.layers[li].opacity, Empty: true}
+
+			c := f.frames[fi].cels[li]
+			if c.image == nil {
+				continue
+			}
+
+			f.drawCelToAtlas(atlas, framesr[fi], c)
+
+			sr := c.image.Bounds()
+			lf[fi].Bounds = image.Rect(
+				framesr[fi].Min.X+sr.Min.X,
+				framesr[fi].Min.Y+sr.Min.Y,
+				framesr[fi].Min.X+sr.Max.X,
+				framesr[fi].Min.Y+sr.Max.Y,
+			).Intersect(framesr[fi])
+			lf[fi].CelBounds = sr
+			lf[fi].Opacity = c.opacity
+			lf[fi].Linked = c.linked
+			lf[fi].Empty = false
+		}
+
+		atlases[li] = atlas
+		lframes[li] = lf
+	}
+
+	return atlases, lframes
+}
+
+// buildLayerInfos converts the internal layer records into public metadata.
+// Every layer of the file is reported, including hidden, reference and
+// group layers, at its original file index.
+func (f *file) buildLayerInfos() []Layer {
+	infos := make([]Layer, len(f.layers))
+
+	for i, l := range f.layers {
+		infos[i] = Layer{
+			Name:       l.name,
+			Index:      i,
+			Type:       LayerType(l.typ),
+			ChildLevel: int(l.childLvl),
+			Visible:    l.flags&1 != 0,
+			Reference:  l.flags&64 != 0,
+			Opacity:    l.opacity,
+			BlendMode:  BlendMode(l.blendMode),
+		}
+	}
+
+	return infos
 }

@@ -10,6 +10,13 @@ import (
 	"io"
 )
 
+var (
+	errInvalidLayerIndex = errors.New("aseprite: cel references invalid layer index")
+	errInvalidLinkedCel  = errors.New("aseprite: linked cel references invalid frame")
+	errTruncatedCel      = errors.New("aseprite: truncated cel data")
+	errTruncatedLayer    = errors.New("aseprite: truncated layer data")
+)
+
 func skipString(raw []byte) []byte {
 	n := binary.LittleEndian.Uint16(raw)
 	return raw[2+n:]
@@ -182,7 +189,15 @@ func (f *file) initLayers() error {
 }
 
 func (f *file) parseChunk2005(frame int, raw []byte) (*cel, error) {
-	layer := binary.LittleEndian.Uint16(raw)
+	if len(raw) < 16 {
+		return nil, errTruncatedCel
+	}
+
+	layer := int(binary.LittleEndian.Uint16(raw))
+	if layer < 0 || layer >= len(f.layers) {
+		return nil, errInvalidLayerIndex
+	}
+
 	xpos := int(binary.LittleEndian.Uint16(raw[2:]))
 	ypos := int(binary.LittleEndian.Uint16(raw[4:]))
 	opacity := raw[6]
@@ -204,17 +219,35 @@ func (f *file) parseChunk2005(frame int, raw []byte) (*cel, error) {
 
 	switch celtype {
 	case 0: // uncompressed image
+		if len(raw) < 4 {
+			return nil, errTruncatedCel
+		}
 		width := int(binary.LittleEndian.Uint16(raw))
 		height := int(binary.LittleEndian.Uint16(raw[2:]))
 		pix := raw[4:]
+		if len(pix) < width*height*int(f.bpp/8) {
+			return nil, errTruncatedCel
+		}
 		bounds := image.Rect(xpos, ypos, xpos+width, ypos+height)
-		cel := f.makeCel(f, bounds, opacity, pix)
-		f.frames[frame].cels[layer] = cel
+		c := f.makeCel(f, bounds, opacity, pix)
+		c.opacity = opacity
+		f.frames[frame].cels[layer] = c
 	case 1: // linked cel
+		if len(raw) < 2 {
+			return nil, errTruncatedCel
+		}
 		srcFrame := int(binary.LittleEndian.Uint16(raw))
-		srcCel := f.frames[srcFrame].cels[layer]
-		f.frames[frame].cels[layer] = srcCel
+		if srcFrame < 0 || srcFrame >= len(f.frames) {
+			return nil, errInvalidLinkedCel
+		}
+		// Copy the shared cel so the linked marker stays local to this frame.
+		c := f.frames[srcFrame].cels[layer]
+		c.linked = true
+		f.frames[frame].cels[layer] = c
 	case 2: // compressed image
+		if len(raw) < 4 {
+			return nil, errTruncatedCel
+		}
 		width := int(binary.LittleEndian.Uint16(raw))
 		height := int(binary.LittleEndian.Uint16(raw[2:]))
 		zr, err := zlib.NewReader(bytes.NewReader(raw[4:]))
@@ -225,9 +258,13 @@ func (f *file) parseChunk2005(frame int, raw []byte) (*cel, error) {
 		if err != nil {
 			return nil, err
 		}
+		if len(pix) < width*height*int(f.bpp/8) {
+			return nil, errTruncatedCel
+		}
 		bounds := image.Rect(xpos, ypos, xpos+width, ypos+height)
-		cel := f.makeCel(f, bounds, opacity, pix)
-		f.frames[frame].cels[layer] = cel
+		c := f.makeCel(f, bounds, opacity, pix)
+		c.opacity = opacity
+		f.frames[frame].cels[layer] = c
 	default:
 		return nil, errors.New("unsupported cel type")
 	}

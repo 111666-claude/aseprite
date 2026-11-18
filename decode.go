@@ -6,10 +6,23 @@ import (
 	"io"
 )
 
-// Read decodes an Aseprite image from r.
+// Read decodes an Aseprite image from r. Optional decoding features are
+// disabled, so this performs no extra image allocations beyond the
+// composite texture atlas.
 func Read(r io.Reader) (*Aseprite, error) {
+	return ReadWithOptions(r, nil)
+}
+
+// ReadWithOptions decodes an Aseprite image from r with the given options.
+// A nil Options value is equivalent to the zero value and behaves exactly
+// like Read.
+//
+// When opts.LayerAtlases is true, each drawable layer is additionally
+// exported on its own texture atlas. The flattened composite image and all
+// other decode results remain identical to Read.
+func ReadWithOptions(r io.Reader, opts *Options) (*Aseprite, error) {
 	var spr Aseprite
-	if err := spr.readFrom(r); err != nil {
+	if err := spr.readFrom(r, opts); err != nil {
 		return nil, err
 	}
 
